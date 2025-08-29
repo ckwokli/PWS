@@ -7,6 +7,13 @@ import { verifyWithPWS } from '../../server/pws';
 import { runTaskAndWait, runDeepResearch, generateQueriesForClaim } from '../../server/pws-task';
 import { runFindAllAndWait } from '../../server/pws-findall';
 import { readFile } from 'node:fs/promises';
+import { ApiError, badRequest, tooLarge, sendError, ok } from "../../server/errors";
+import { fetchWithTimeout, safeReadText, isValidUrl } from "../../server/http";
+const MAX_FILES = 5;
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_TOTAL_SIZE = 25 * 1024 * 1024; // 25MB
+const ALLOWED_MODES = ['search', 'deep_research', 'task', 'findall'];
+const MAX_LINK_LENGTH = 2048;
 
 // Heuristic cleaner for PDF fallback when pdf-parse fails
 function cleanPdfFallback(buffer) {
@@ -35,15 +42,20 @@ function cleanPdfParsedText(text) {
     .join('\n');
 }
 
-export const config = { api: { bodyParser: false } };
+export const config = { api: { bodyParser: false, responseLimit: MAX_TOTAL_SIZE } }
 
 async function parseFiles(files) {
   const texts = [];
+  let totalSize = 0;
   for (const f of files) {
     const filepath = f.filepath || f.path;
     const mimetype = f.mimetype || f.type || '';
     const size = f.size || 0;
     if (size > 10 * 1024 * 1024) {
+    totalSize += size;
+    if (totalSize > MAX_TOTAL_SIZE) {
+      throw tooLarge(`Total upload size exceeds limit (${Math.round(totalSize/1024/1024)}MB > ${Math.round(MAX_TOTAL_SIZE/1024/1024)}MB)`);
+    }
       throw new Error(`File too large: ${f.originalFilename || f.name}`);
     }
     const buf = await readFile(filepath);
@@ -71,10 +83,10 @@ async function parseFiles(files) {
 }
 
 async function fetchChatGPTShared(link) {
-  try {
-    const res = await fetch(link, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!isValidUrl(link)) { return ''; }
+    const res = await fetchWithTimeout(link, { headers: { 'User-Agent': 'Mozilla/5.0' } }, { timeoutMs: 10000, maxBytes: 1000000 });
     if (!res.ok) return '';
-    const html = await res.text();
+    const html = await safeReadText(res, 1000000);
     const $ = cheerio.load(html);
     
     // Special handling for ChatGPT shared conversations
@@ -165,82 +177,73 @@ async function fetchChatGPTShared(link) {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+  try {
+    if (req.method !== 'POST') return sendError(res, badRequest('Method Not Allowed', { method: req.method }));
 
-  const form = formidable({ multiples: true });
-  form.parse(req, async (err, fields, files) => {
-    try {
-      if (err) throw err;
-      const flist = Array.isArray(files.files) ? files.files : files.files ? [files.files] : [];
-      const link = (fields.link && (Array.isArray(fields.link) ? fields.link[0] : fields.link)) || '';
-      const mode = (fields.mode && (Array.isArray(fields.mode) ? fields.mode[0] : fields.mode)) || 'search';
-      const output_schema = (fields.output_schema && (Array.isArray(fields.output_schema) ? fields.output_schema[0] : fields.output_schema)) || '';
+    const form = formidable({ multiples: true, maxFiles: MAX_FILES, maxFileSize: MAX_FILE_SIZE, maxTotalFileSize: MAX_TOTAL_SIZE });
+    form.parse(req, async (err, fields, files) => {
+      try {
+        if (err) throw err;
+        const flist = Array.isArray(files.files) ? files.files : files.files ? [files.files] : [];
+        if (flist.length > MAX_FILES) throw tooLarge(`Too many files (${flist.length} > ${MAX_FILES})`);
 
-      let combinedText = '';
-      if (flist.length) {
-        combinedText += await parseFiles(flist);
-      }
-      if (link) {
-        const linkText = await fetchChatGPTShared(link);
-        if (linkText) combinedText += (combinedText ? '\n\n' : '') + linkText;
-      }
+        const link = (fields.link && (Array.isArray(fields.link) ? fields.link[0] : fields.link)) || '';
+        const mode = (fields.mode && (Array.isArray(fields.mode) ? fields.mode[0] : fields.mode)) || 'search';
+        const output_schema = (fields.output_schema && (Array.isArray(fields.output_schema) ? fields.output_schema[0] : fields.output_schema)) || '';
 
-      if (!combinedText) return res.status(400).json({ error: 'No content to verify' });
+        if (!ALLOWED_MODES.includes(mode)) throw badRequest(`Invalid mode: ${mode}`);
+        if (link && (link.length > MAX_LINK_LENGTH || !isValidUrl(link))) throw badRequest('Invalid link URL');
 
-      // Mode: Deep Research (Task API ultra)
-      if (mode === 'deep_research') {
-        const out = await runDeepResearch({ input: combinedText });
-        return res.json({
-          mode,
-          source: { text: combinedText },
-          deep_research: out?.output?.content || out?.output || null,
-          basis: out?.output?.basis || [],
-          status: out?.status,
-          run_id: out?.run_id,
-        });
-      }
+        let combinedText = '';
+        if (flist.length) combinedText += await parseFiles(flist);
+        if (link) {
+          const linkText = await fetchChatGPTShared(link);
+          if (linkText) combinedText += (combinedText ? '
 
-      // Mode: Task (Task API with optional output_schema)
-      if (mode === 'task') {
-        const out = await runTaskAndWait({ input: combinedText, output_schema });
-        return res.json({
-          mode,
-          source: { text: combinedText },
-          output: out?.output || null,
-          status: out?.status,
-          run_id: out?.run_id,
-        });
-      }
-
-      // Mode: FindAll (Ingest -> Run -> Poll)
-      if (mode === 'findall') {
-        const out = await runFindAllAndWait({ query: combinedText });
-        return res.json({
-          mode,
-          source: { text: combinedText },
-          results: out?.results || [],
-          meta: {
-            status: out?.status,
-            is_active: out?.is_active,
-            are_enrichments_active: out?.are_enrichments_active,
-            pages_read: out?.pages_read,
-            pages_considered: out?.pages_considered,
-            max_results: out?.max_results,
-          },
-        });
-      }
-
-      // Mode: Search (default)
-      if (mode === 'search') {
-        const claims = extractClaims(combinedText).slice(0, 50);
-        if (process.env.NODE_ENV !== 'production') {
-          console.debug(`[verify v1] source_len=${combinedText.length} claims=${claims.length}`);
+' : '') + linkText;
         }
+
+        if (!combinedText) return sendError(res, badRequest('No content to verify'));
+
+        if (mode === 'deep_research') {
+          const out = await runDeepResearch({ input: combinedText });
+          return ok(res, {
+            mode,
+            source: { text: combinedText },
+            deep_research: out?.output?.content || out?.output || null,
+            basis: out?.output?.basis || [],
+            status: out?.status,
+            run_id: out?.run_id,
+          });
+        }
+
+        if (mode === 'task') {
+          const out = await runTaskAndWait({ input: combinedText, output_schema });
+          return ok(res, {
+            mode,
+            source: { text: combinedText },
+            output: out?.output || null,
+            status: out?.status,
+            run_id: out?.run_id,
+          });
+        }
+
+        if (mode === 'findall') {
+          const out = await runFindAllAndWait({ query: combinedText });
+          return ok(res, {
+            mode,
+            source: { text: combinedText },
+            results: out?.results || [],
+            status: out?.status,
+            findall_id: out?.findall_id,
+          });
+        }
+
+        // Default: search
+        const claims = extractClaims(combinedText).slice(0, 50);
         const items = [];
         for (const claim of claims) {
-          // Generate diversified queries for the claim via Task API
           const queries = await generateQueriesForClaim(claim);
-          // Verify using Parallel Search with deeper settings and a calibrated threshold
           const result = await verifyWithPWS(
             claim,
             queries,
@@ -249,25 +252,12 @@ export default async function handler(req, res) {
           items.push(result);
           await new Promise(r => setTimeout(r, 50));
         }
-
-        const summary = {
-          claims: claims.length,
-          supported: items.filter(i => i.status === 'supported').length,
-          insufficient: items.filter(i => i.status === 'insufficient').length,
-          mode: 'search',
-        };
-        return res.status(200).json({
-          source: combinedText,
-          items,
-          summary,
-        });
+        return ok(res, { mode: 'search', source: { text: combinedText }, items });
+      } catch (e) {
+        return sendError(res, e instanceof ApiError ? e : new ApiError(500, 'server_error', e.message || 'Internal Error'));
       }
-
-      // Fallback if unknown mode
-      return res.status(400).json({ error: `Unsupported mode: ${mode}` });
-    } catch (e) {
-      console.error(e);
-      res.status(500).send(e.message || 'Internal Error');
-    }
-  });
+    });
+  } catch (e) {
+    return sendError(res, e instanceof ApiError ? e : new ApiError(500, 'server_error', e.message || 'Internal Error'));
+  }
 }
