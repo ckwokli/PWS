@@ -83,6 +83,7 @@ async function parseFiles(files) {
 }
 
 async function fetchChatGPTShared(link) {
+  try {
     if (!isValidUrl(link)) { return ''; }
     const res = await fetchWithTimeout(link, { headers: { 'User-Agent': 'Mozilla/5.0' } }, { timeoutMs: 10000, maxBytes: 1000000 });
     if (!res.ok) return '';
@@ -198,9 +199,7 @@ export default async function handler(req, res) {
         if (flist.length) combinedText += await parseFiles(flist);
         if (link) {
           const linkText = await fetchChatGPTShared(link);
-          if (linkText) combinedText += (combinedText ? '
-
-' : '') + linkText;
+          if (linkText) combinedText += (combinedText ? '\\n\\n' : '') + linkText;
         }
 
         if (!combinedText) return sendError(res, badRequest('No content to verify'));
