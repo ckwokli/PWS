@@ -42,7 +42,7 @@ function cleanPdfParsedText(text) {
     .join('\n');
 }
 
-export const config = { api: { bodyParser: false, responseLimit: MAX_TOTAL_SIZE } }
+export const config = { api: { bodyParser: false, responseLimit: 25 * 1024 * 1024 } }
 
 async function parseFiles(files) {
   const texts = [];
@@ -51,12 +51,12 @@ async function parseFiles(files) {
     const filepath = f.filepath || f.path;
     const mimetype = f.mimetype || f.type || '';
     const size = f.size || 0;
-    if (size > 10 * 1024 * 1024) {
     totalSize += size;
+    if (size > MAX_FILE_SIZE) {
+      throw tooLarge(`File too large: ${f.originalFilename || f.name} (${Math.round(size/1024/1024)}MB > ${Math.round(MAX_FILE_SIZE/1024/1024)}MB)`);
+    }
     if (totalSize > MAX_TOTAL_SIZE) {
       throw tooLarge(`Total upload size exceeds limit (${Math.round(totalSize/1024/1024)}MB > ${Math.round(MAX_TOTAL_SIZE/1024/1024)}MB)`);
-    }
-      throw new Error(`File too large: ${f.originalFilename || f.name}`);
     }
     const buf = await readFile(filepath);
     if (/pdf$/i.test(mimetype) || /\.pdf$/i.test(f.originalFilename || '')) {
