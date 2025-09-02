@@ -1,5 +1,7 @@
 // Parallel Search API integration (v1)
 // Docs: https://docs.parallel.ai/api-reference/search-api/search
+import { fetchWithTimeout, withRetry, safeReadText } from './http';
+
 const ENV_BASE = process.env.PWS_BASE_URL;
 const API_KEY = process.env.PWS_API_KEY || '';
 
@@ -34,18 +36,32 @@ async function callParallelSearch(objective, queries, { processor = 'base', max_
     max_results,
     max_chars_per_result,
   };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': API_KEY,
-    },
-    body: JSON.stringify(body),
-  });
+  
+  const res = await withRetry(
+    async () => fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': API_KEY,
+        },
+        body: JSON.stringify(body),
+      },
+      { timeoutMs: 12000, maxBytes: 1_000_000 }
+    ),
+    {
+      retries: 2,
+      baseBackoffMs: 600,
+      shouldRetry: (err) => !err.status || (err.status >= 500 && err.status < 600)
+    }
+  );
+
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
+    const text = await safeReadText(res);
     throw new Error(`Parallel Search error ${res.status}: ${text || res.statusText}`);
   }
+
   const data = await res.json();
   const results = Array.isArray(data.results) ? data.results : [];
   const evidence = results.slice(0, max_results).map(r => ({
@@ -53,7 +69,6 @@ async function callParallelSearch(objective, queries, { processor = 'base', max_
     snippet: Array.isArray(r.excerpts) ? r.excerpts.filter(Boolean).join(' … ') : '',
     title: r.title,
   }));
-  // Confidence: combine overlap, domain trust, and a bounded excerpt factor
   const excerptCount = results.reduce((acc, r) => acc + ((r.excerpts || []).length), 0);
   const text = evidence.map(e => e.snippet).join(' ').toLowerCase();
   const claimTokens = String(objective || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 4);
@@ -69,15 +84,13 @@ async function callParallelSearch(objective, queries, { processor = 'base', max_
       if (/(wikipedia\.org)$/i.test(host)) return 0.6;
       return 0.4;
     };
-    const hosts = results.map(r => {
-      try { return new URL(r.url).host; } catch { return ''; }
-    }).filter(Boolean);
+    const hosts = results.map(r => { try { return new URL(r.url).host; } catch { return ''; } }).filter(Boolean);
     if (!hosts.length) return 0;
     const avg = hosts.reduce((a, h) => a + trustDomain(h), 0) / hosts.length;
     return Math.min(1, Math.max(0, avg));
   })();
 
-  const excerptFactor = Math.tanh(excerptCount / 5); // 0..~1
+  const excerptFactor = Math.tanh(excerptCount / 5);
   const confidence = Math.max(0, Math.min(1, (overlap * 0.6) + (domainTrustScore * 0.25) + (excerptFactor * 0.15)));
   return { evidence, confidence };
 }

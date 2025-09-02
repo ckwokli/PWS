@@ -1,37 +1,88 @@
 // Parallel FindAll API integration (ingest -> run -> poll)
-const ROOT = (process.env.PWS_BASE_URL || 'https://api.parallel.ai').replace(/\/$/, '');
+import { fetchWithTimeout, withRetry, fetchJson, safeReadText } from './http';
+
+// Normalize base URL to always point at /v1beta
+const ENV_BASE = process.env.PWS_BASE_URL || 'https://api.parallel.ai';
+const BASE = ENV_BASE.replace(/\/$/, '')
+  .replace(/\/v1$/, '/v1beta')
+  .replace(/\/v1beta$/, '/v1beta');
 const API_KEY = process.env.PWS_API_KEY || '';
 
 async function ingestFindAll(query) {
   if (!API_KEY) throw new Error('Missing PWS_API_KEY');
-  const url = `${ROOT}/v1beta/findall/ingest`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
-    body: JSON.stringify({ query: String(query || '').slice(0, 2000) }),
-  });
-  if (!res.ok) throw new Error(`FindAll ingest error ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
-  return res.json(); // findall_spec
+  const url = `${BASE}/findall/ingest`;
+
+  const res = await withRetry(
+    () =>
+      fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+          body: JSON.stringify({ query: String(query || '').slice(0, 2000) }),
+        },
+        { timeoutMs: 12000, maxBytes: 1_000_000 }
+      ),
+    {
+      retries: 2,
+      baseBackoffMs: 600,
+      shouldRetry: (err) => !err.status || (err.status >= 500 && err.status < 600),
+    }
+  );
+
+  if (!res.ok) {
+    const errorText = await safeReadText(res);
+    throw new Error(`FindAll ingest error ${res.status}: ${errorText || res.statusText}`);
+  }
+  return res.json();
 }
 
 async function startFindAllRun({ findall_spec, processor = 'base', result_limit = 50 }) {
   if (!API_KEY) throw new Error('Missing PWS_API_KEY');
-  const url = `${ROOT}/v1beta/findall/runs`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
-    body: JSON.stringify({ findall_spec, processor, result_limit }),
-  });
-  if (!res.ok) throw new Error(`FindAll run error ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
-  return res.json(); // { findall_id, status }
+  const url = `${BASE}/findall/runs`;
+
+  const res = await withRetry(
+    () =>
+      fetchWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+          body: JSON.stringify({ findall_spec, processor, result_limit }),
+        },
+        { timeoutMs: 12000, maxBytes: 1_000_000 }
+      ),
+    {
+      retries: 2,
+      baseBackoffMs: 600,
+      shouldRetry: (err) => !err.status || (err.status >= 500 && err.status < 600),
+    }
+  );
+
+  if (!res.ok) {
+    const errorText = await safeReadText(res);
+    throw new Error(`FindAll run error ${res.status}: ${errorText || res.statusText}`);
+  }
+  return res.json();
 }
 
 async function getFindAllRun(findall_id) {
   if (!API_KEY) throw new Error('Missing PWS_API_KEY');
-  const url = `${ROOT}/v1beta/findall/runs/${encodeURIComponent(findall_id)}`;
-  const res = await fetch(url, { headers: { 'x-api-key': API_KEY } });
-  if (!res.ok) throw new Error(`FindAll poll error ${res.status}: ${await res.text().catch(()=>res.statusText)}`);
-  return res.json();
+  const url = `${BASE}/findall/runs/${encodeURIComponent(findall_id)}`;
+
+  return withRetry(
+    () =>
+      fetchJson(
+        url,
+        { headers: { 'x-api-key': API_KEY } },
+        { timeoutMs: 12000, maxBytes: 1_000_000 }
+      ),
+    {
+      retries: 2,
+      baseBackoffMs: 600,
+      shouldRetry: (err) => !err.status || (err.status >= 500 && err.status < 600),
+    }
+  );
 }
 
 export async function runFindAllAndWait({ query, processor = 'base', result_limit = 20, pollMs = 2000, maxWaitMs = 120000 }) {
