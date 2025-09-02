@@ -42,7 +42,7 @@ function cleanPdfParsedText(text) {
     .join('\n');
 }
 
-export const config = { api: { bodyParser: false, responseLimit: 25 * 1024 * 1024 } }
+export const config = { api: { bodyParser: false, responseLimit: 26214400 } }
 
 async function parseFiles(files) {
   const texts = [];
