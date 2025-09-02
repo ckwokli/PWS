@@ -184,7 +184,20 @@ export default async function handler(req, res) {
     const form = formidable({ multiples: true, maxFiles: MAX_FILES, maxFileSize: MAX_FILE_SIZE, maxTotalFileSize: MAX_TOTAL_SIZE });
     form.parse(req, async (err, fields, files) => {
       try {
-        if (err) throw err;
+        if (err) {
+          const msg = String(err?.message || err || '');
+          const code = String(err?.code || '');
+          if (msg.includes('maxFiles') || code === 'LIMIT_FILE_COUNT') {
+            return sendError(res, tooLarge(`Too many files (${MAX_FILES} max)`));
+          }
+          if (msg.includes('maxFileSize') || code === 'ETOOBIG' || code === 'LIMIT_FILE_SIZE') {
+            return sendError(res, tooLarge('File too large'));
+          }
+          if (msg.includes('maxTotalFileSize')) {
+            return sendError(res, tooLarge('Total upload too large'));
+          }
+          return sendError(res, badRequest(msg));
+        }
         const flist = Array.isArray(files.files) ? files.files : files.files ? [files.files] : [];
         if (flist.length > MAX_FILES) throw tooLarge(`Too many files (${flist.length} > ${MAX_FILES})`);
 
